@@ -33,7 +33,10 @@ SIGN_PRESERVING_MODULES = (
     nn.AdaptiveAvgPool3d,
     nn.PixelShuffle,
     nn.PixelUnshuffle,
-    nn.Identity)
+    nn.Identity,
+    nn.Upsample,
+    nn.UpsamplingBilinear2d,
+    nn.UpsamplingNearest2d)
 
 PRECISION_PRESERVING_MODULES = (
     nn.Dropout,
@@ -44,7 +47,11 @@ PRECISION_PRESERVING_MODULES = (
     nn.MaxPool3d,
     nn.PixelShuffle,
     nn.PixelUnshuffle,
-    nn.Identity)
+    nn.Identity,
+    nn.Upsample,
+    nn.UpsamplingBilinear2d,
+    nn.UpsamplingNearest2d
+    )
 
 MAX_RESIDUAL_ITERS = 9999
 
@@ -85,14 +92,14 @@ def are_inputs_unsigned(model, node, is_unsigned_list, quant_act_map, unsigned_a
             else:
                 is_unsigned_list.append(False)
         elif inp_node.op == 'call_function':
-            if inp_node.target in [torch.reshape, torch.flatten, torch.transpose, torch.cat
+            if inp_node.target in [torch.reshape, torch.flatten, torch.transpose, torch.cat,operator.getitem, operator.__getitem__
                                   ] + ADD_FNS:
                 are_inputs_unsigned(
                     model, inp_node, is_unsigned_list, quant_act_map, unsigned_act_tuple)
             else:
                 is_unsigned_list.append(False)
         elif inp_node.op == 'call_method':
-            if inp_node.target in ['view', 'reshape', 'flatten', 't', 'permute'] + ADD_METHODS:
+            if inp_node.target in ['view', 'reshape', 'flatten', 't', 'permute','chunk'] + ADD_METHODS:
                 are_inputs_unsigned(
                     model, inp_node, is_unsigned_list, quant_act_map, unsigned_act_tuple)
             else:
@@ -137,7 +144,7 @@ def are_inputs_quantized_and_aligned(model, node, quantized_modules_list, quant_
             else:
                 quantized_modules_list.append(None)
         elif inp_node.op == 'call_function':
-            if inp_node.target in [torch.reshape, torch.flatten, torch.transpose]:
+            if inp_node.target in [torch.reshape, torch.flatten, torch.transpose, operator.getitem, operator.__getitem__]:
                 are_inputs_quantized_and_aligned(
                     model, inp_node, quantized_modules_list, quant_act_map, same_sign)
             elif inp_node.target is torch.cat:
@@ -149,7 +156,7 @@ def are_inputs_quantized_and_aligned(model, node, quantized_modules_list, quant_
             else:
                 quantized_modules_list.append(None)
         elif inp_node.op == 'call_method':
-            if inp_node.target in ['view', 'reshape', 'flatten', 't', 'permute']:
+            if inp_node.target in ['view', 'reshape', 'flatten', 't', 'permute','chunk']:
                 are_inputs_quantized_and_aligned(
                     model, inp_node, quantized_modules_list, quant_act_map, same_sign)
             elif inp_node.target in ADD_METHODS:
@@ -213,6 +220,132 @@ def output_quant_handler(
                 model.add_module(quant_module_name, quant_module)
                 rewriters.append(InsertModuleCallAfter(quant_module_name, node))
 
+def recursive_reverse_handler(
+        model,
+        node,
+        shared_quant_identity_name,
+        shared_quant_identity,
+        rewriters,
+        quant_identity_map,
+        align_input_quant_fn,
+        align_sign,
+        path_list,
+        processed):
+    """
+    For a given CAT or ADD node, iterate through its inputs to make sure they are correctly aligned.
+    """
+    if node.name in processed:
+        # print("I", *path_list, node.name, sep='.')
+        return True
+    path_list.append(node.name)
+    # print("R", *path_list, sep='.')
+    forward_called = []
+    for out_node in node.users:
+        if out_node.op == 'call_module':
+            module = get_module(model, out_node.target)
+            # Precision preserving modules can be safely traversed
+            # In case align_sign is True, the modules should also be sign preserving
+            if isinstance(module, tuple(PRECISION_PRESERVING_MODULES)) and (
+                    not align_sign or
+                (align_sign and isinstance(module, tuple(SIGN_PRESERVING_MODULES)))):
+                fwc = recursive_reverse_handler(
+                    model,
+                    out_node,
+                    shared_quant_identity_name,
+                    shared_quant_identity,
+                    rewriters,
+                    quant_identity_map,
+                    align_input_quant_fn,
+                    align_sign,
+                    path_list,
+                    processed)
+                forward_called.append(fwc)
+        elif out_node.op == 'call_function' and out_node.target in [
+                torch.flatten, torch.reshape, torch.transpose, torch.chunk, operator.getitem,
+                operator.__getitem__]:
+            fwc = recursive_reverse_handler(
+                model,
+                out_node,
+                shared_quant_identity_name,
+                shared_quant_identity,
+                rewriters,
+                quant_identity_map,
+                align_input_quant_fn,
+                align_sign,
+                path_list,
+                processed)
+            forward_called.append(fwc)
+        elif out_node.op == 'call_function' and out_node.target is CAT:
+            fwc = recursive_reverse_handler(
+                model,
+                out_node,
+                shared_quant_identity_name,
+                shared_quant_identity,
+                rewriters,
+                quant_identity_map,
+                align_input_quant_fn,
+                align_sign,
+                path_list,
+                processed)
+            forward_called.append(fwc)
+            if not fwc:
+                processed.append(out_node.name)
+                recursive_input_handler(
+                    model,
+                    out_node,
+                    shared_quant_identity_name,
+                    shared_quant_identity,
+                    rewriters,
+                    quant_identity_map,
+                    align_input_quant_fn,
+                    align_sign=True,
+                    path_list=path_list,
+                    processed=processed)
+        elif (out_node.op == 'call_function' and out_node.target in ADD_FNS) or (
+              out_node.op == 'call_method' and out_node.target in ADD_METHODS):
+            fwc = recursive_reverse_handler(
+                model,
+                out_node,
+                shared_quant_identity_name,
+                shared_quant_identity,
+                rewriters,
+                quant_identity_map,
+                align_input_quant_fn,
+                align_sign,
+                path_list,
+                processed)
+            forward_called.append(fwc)
+            if not fwc:
+                processed.append(out_node.name)
+                recursive_input_handler(
+                    model,
+                    out_node,
+                    shared_quant_identity_name,
+                    shared_quant_identity,
+                    rewriters,
+                    quant_identity_map,
+                    align_input_quant_fn,
+                    align_sign,
+                    path_list,
+                    processed)
+        elif out_node.op == 'call_method' and out_node.target in [
+                'view', 'reshape', 'flatten', 'transpose', 'chunk']:
+            fwc = recursive_reverse_handler(
+                model,
+                out_node,
+                shared_quant_identity_name,
+                shared_quant_identity,
+                rewriters,
+                quant_identity_map,
+                align_input_quant_fn,
+                align_sign,
+                path_list,
+                processed)
+            forward_called.append(fwc)
+        else:
+            print(f"Unhandled in reverse pass: {out_node}")
+    path_list.pop()
+    return any(forward_called)
 
 def recursive_input_handler(
         model,
@@ -222,10 +355,15 @@ def recursive_input_handler(
         rewriters,
         quant_identity_map,
         align_input_quant_fn,
-        align_sign):
+        align_sign,
+        path_list,
+        processed):
     """
     For a given CAT or ADD node, iterate through its inputs to make sure they are correctly aligned.
     """
+    path_list.append(node.name)
+    # print("F", *path_list, sep='.')
+    pass
     for inp_node in node.all_input_nodes:
         if inp_node.op == 'call_module':
             module = get_module(model, inp_node.target)
@@ -242,7 +380,10 @@ def recursive_input_handler(
                     rewriters,
                     quant_identity_map,
                     align_input_quant_fn,
-                    align_sign)
+                    align_sign,
+                    path_list,
+                    processed
+                )
             else:
                 # Based on the current module, generate an align_output object
                 align_output = align_input_quant_fn(
@@ -269,8 +410,19 @@ def recursive_input_handler(
                     rewriters.append(InsertModuleCallAfter(shared_quant_identity_name, inp_node))
                 else:
                     assert align_output is None, f"align_output {str(align_output)} not supported."
+                recursive_reverse_handler(
+                    model,
+                    inp_node,
+                    shared_quant_identity_name,
+                    shared_quant_identity,
+                    rewriters,
+                    quant_identity_map,
+                    align_input_quant_fn,
+                    align_sign,
+                    path_list,
+                    processed)
         elif inp_node.op == 'call_function' and inp_node.target in [
-                torch.flatten, torch.reshape, torch.transpose]:
+                torch.flatten, torch.reshape, torch.transpose, operator.getitem,operator.__getitem__]+ ADD_FNS:
             recursive_input_handler(
                 model,
                 inp_node,
@@ -279,7 +431,10 @@ def recursive_input_handler(
                 rewriters,
                 quant_identity_map,
                 align_input_quant_fn,
-                align_sign)
+                align_sign,
+                path_list,
+                processed
+            )
         elif inp_node.op == 'call_function' and inp_node.target is torch.cat:
             recursive_input_handler(
                 model,
@@ -289,9 +444,12 @@ def recursive_input_handler(
                 rewriters,
                 quant_identity_map,
                 align_input_quant_fn,
-                align_sign=True)
+                align_sign=True,
+                path_list=path_list,
+                processed=processed
+            )
         elif inp_node.op == 'call_method' and inp_node.target in [
-                'view', 'reshape', 'flatten', 'transpose']:
+                'view', 'reshape', 'flatten', 'transpose','chunk'] + ADD_METHODS:
             recursive_input_handler(
                 model,
                 inp_node,
@@ -302,7 +460,9 @@ def recursive_input_handler(
                 align_input_quant_fn,
                 align_sign)
         else:
+            print(f"    Add quantization \"{shared_quant_identity_name}\" after {inp_node.name}")
             rewriters.append(InsertModuleCallAfter(shared_quant_identity_name, inp_node))
+        path_list.pop()
 
 
 def _get_quant_module(model, node, quant_identity_map, quant_act_map, unsigned_act_tuple):
@@ -347,6 +507,8 @@ def residual_handler(
                 shared_quant_identity, shared_quant_identity_name = _get_quant_module(
                     model, node, quant_identity_map, quant_act_map, unsigned_act_tuple)
 
+                processed = [node.name]
+
                 # Recursively, for every input node, traverse the graph to determine how to quantize
                 # and align that input node.
                 recursive_input_handler(
@@ -357,7 +519,10 @@ def residual_handler(
                     rewriters,
                     quant_identity_map,
                     align_input_quant_fn,
-                    align_sign=same_sign)
+                    align_sign=same_sign,
+                    path_list=[],
+                    processed=processed
+                )
                 for rewriter in rewriters:
                     model = rewriter.apply(model)
                 model.graph.lint()
@@ -474,17 +639,19 @@ def layer_handler(
                     ) and not 'input_quant' in quant_module_kwargs and len(quant_identity_map) > 0:
                         # Define the source node where to add the requantization step
                         previous_node = node.all_input_nodes[0]
-                        # Exclude all the other possible users
-                        previous_node_users = list(previous_node.users.keys())
-                        previous_node_users.remove(node)
+                        if not (previous_node.op == 'call_function' and previous_node.target in ADD_FNS + [CAT] or
+                                previous_node.op == 'call_method' and previous_node.target in ADD_METHODS):
+                            # Exclude all the other possible users
+                            previous_node_users = list(previous_node.users.keys())
+                            previous_node_users.remove(node)
 
-                        act_quant, kwargs_act_quant = quant_identity_map['signed']
-                        inp_quant = act_quant(**kwargs_act_quant)
-                        name = node.name + '_input_quant'
-                        model.add_module(name, inp_quant)
-                        rewriter = InsertModuleCallAfter(
-                            name, previous_node, tuple(previous_node_users))
-                        rewriters.append(rewriter)
+                            act_quant, kwargs_act_quant = quant_identity_map['signed']
+                            inp_quant = act_quant(**kwargs_act_quant)
+                            name = node.name + '_input_quant'
+                            model.add_module(name, inp_quant)
+                            rewriter = InsertModuleCallAfter(
+                                name, previous_node, tuple(previous_node_users))
+                            rewriters.append(rewriter)
                     rewriter = ModuleToModuleByInstance(
                         module, quant_module_class, **quant_module_kwargs)
                     rewriters.append(rewriter)
