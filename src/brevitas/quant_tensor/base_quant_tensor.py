@@ -105,6 +105,8 @@ class QuantTensor:
         return self.value.size(*args, **kwargs)
 
 
+
+
 class IntQuantTensorBase(NamedTuple):
     value: Tensor
     scale: Tensor
